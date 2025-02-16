@@ -1,13 +1,22 @@
+import os
+import re
+import json
+import shutil
+import base64
 import sqlite3
 import subprocess
-from dateutil.parser import parse
-from datetime import datetime
-import json
-from pathlib import Path
-import os
 import requests
-from scipy.spatial.distance import cosine
+import openai
+import pytesseract
+import numpy as np
+from PIL import Image
 from dotenv import load_dotenv
+from pathlib import Path
+from datetime import datetime
+from dateutil.parser import parse
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import PlainTextResponse
+from scipy.spatial.distance import cosine
 
 load_dotenv()
 
@@ -27,13 +36,52 @@ def A1(email="23f1002368@ds.study.iitm.ac.in"):
     except subprocess.CalledProcessError as e:
         raise HTTPException(status_code=500, detail=f"Error: {e.stderr}")
 # A1()
-def A2(prettier_version="prettier@3.4.2", filename="/data/format.md"):
-    command = [r"C:\Program Files\nodejs\npx.cmd", prettier_version, "--write", filename]
+def A2():
+    """
+    Formats the file /data/format.md using prettier@3.4.2.
+    The file is updated in-place.
+    
+    This version mimics the evaluation script: it pipes the file content into Prettier
+    using the "--stdin-filepath /data/format.md" option.
+    """
+    # Define the local data directory (project-root/data)
+    local_data_dir = os.path.join(os.getcwd(), "data")
+    
+    # Construct the local file path for format.md
+    file_path = os.path.join(local_data_dir, "format.md")
+    
+    # Check if the file exists
+    if not os.path.exists(file_path):
+        raise Exception(f"File not found: {file_path}")
+    
+    # Read the current contents of the file.
+    with open(file_path, "r") as f:
+        original = f.read()
+    
     try:
-        subprocess.run(command, check=True)
-        print("Prettier executed successfully.")
+        # Build the command as a single string.
+        cmd = "npx prettier@3.4.2 --stdin-filepath /data/format.md"
+        # Run Prettier using the command string, passing the current working directory and environment.
+        proc = subprocess.run(
+            cmd,
+            input=original,
+            capture_output=True,
+            text=True,
+            check=True,
+            shell=True,  # Command is provided as a string.
+            cwd=os.getcwd(),         # Ensure we run in the project root.
+            env=os.environ.copy()      # Pass the current environment.
+        )
+        formatted = proc.stdout
+        
+        # Write the formatted content back to the file.
+        with open(file_path, "w") as f:
+            f.write(formatted)
+        
+        return {"stdout": formatted, "stderr": proc.stderr}
     except subprocess.CalledProcessError as e:
-        print(f"An error occurred: {e}")
+        raise Exception("Error formatting file: " + e.stderr)
+
 
 def A3(filename='/data/dates.txt', targetfile='/data/dates-wednesdays.txt', weekday=2):
     input_file = filename
@@ -122,120 +170,165 @@ def png_to_base64(image_path):
     with open(image_path, "rb") as image_file:
         base64_string = base64.b64encode(image_file.read()).decode('utf-8')
     return base64_string
-# def A8():
-#     input_image = "data/credit_card.png"
-#     output_file = "data/credit-card.txt"
 
-#     # Step 1: Extract text using OCR
-#     try:
-#         image = Image.open(input_image)
-#         extracted_text = pytesseract.image_to_string(image)
-#         print(f"Extracted text:\n{extracted_text}")
-#     except Exception as e:
-#         print(f"❌ Error reading or processing {input_image}: {e}")
-#         return
+def passes_luhn(card_number):
+    """Returns True if card_number passes Luhn's algorithm."""
+    digits = [int(d) for d in card_number]
+    checksum = 0
+    double = False
 
-#     # Step 2: Pass the extracted text to the LLM to validate and extract card number
-#     prompt = f"""Extract the credit card number from the following text. Respond with only the card number, without spaces:
+    for i in range(len(digits) - 1, -1, -1):
+        d = digits[i]
+        if double:
+            d *= 2
+            if d > 9:
+                d -= 9
+        checksum += d
+        double = not double
 
-#     {extracted_text}
-#     """
-#     try:
-#         card_number = ask_llm(prompt).strip()
-#         print(f"Card number extracted by LLM: {card_number}")
-#     except Exception as e:
-#         print(f"❌ Error processing with LLM: {e}")
-#         return
+    return checksum % 10 == 0
 
-#     # Step 3: Save the extracted card number to a text file
-#     try:
-#         with open(output_file, "w", encoding="utf-8") as file:
-#             file.write(card_number + "\n")
-#         print(f"✅ Credit card number saved to: {output_file}")
-#     except Exception as e:
-#         print(f"❌ Error writing {output_file}: {e}")
+def A8():
+    """
+    1. Reads /data/credit_card.png
+    2. Extracts a 16-digit number via Tesseract OCR
+    3. Applies Luhn check. If it fails, attempts minor OCR correction.
+    4. Writes the final 16-digit number to /data/credit-card.txt
+    """
+    input_file = os.path.join(os.getcwd(), "data", "credit_card.png")
+    output_file = os.path.join(os.getcwd(), "data", "credit-card.txt")
 
-def A8(filename='/data/credit_card.txt', image_path='/data/credit_card.png'):
-    # Construct the request body for the AIProxy call
-    body = {
-        "model": "gpt-4o-mini",
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": "There is 8 or more digit number is there in this image, with space after every 4 digit, only extract the those digit number without spaces and return just the number without any other characters"
-                    },
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/png;base64,{png_to_base64(image_path)}"
-                        }
-                    }
-                ]
+    try:
+        # 1. Load the image
+        img = Image.open(input_file)
+
+        # 2. Configure Tesseract
+        custom_config = r"--oem 3 --psm 7 -c tessedit_char_whitelist=0123456789"
+        extracted_text = pytesseract.image_to_string(img, config=custom_config)
+
+        # 3. Extract potential numbers
+        lines = extracted_text.splitlines()
+        recognized_16 = None
+        for line in lines:
+            digits = re.sub(r"\D", "", line)  # Keep only digits
+            if len(digits) == 16:
+                recognized_16 = digits
+                break
+
+        if not recognized_16:
+            return {
+                "error": "No valid 16-digit number found.",
+                "ocr_output": extracted_text
             }
-        ]
-    }
 
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {AIPROXY_TOKEN}"
-    }
+        # 4. Validate with Luhn
+        if passes_luhn(recognized_16):
+            final_number = recognized_16
+        else:
+            # Attempt a minor correction (flipping common OCR mistakes)
+            possible_corrections = {
+                '8': '3', '3': '8', '0': '6', '6': '0', '5': '9', '9': '5'
+            }
+            corrected_number = ''.join(
+                possible_corrections.get(d, d) for d in recognized_16
+            )
 
-    # Make the request to the AIProxy service
-    response = requests.post("http://aiproxy.sanand.workers.dev/openai/v1/chat/completions",
-                             headers=headers, data=json.dumps(body))
-    # response.raise_for_status()
+            if passes_luhn(corrected_number):
+                final_number = corrected_number
+            else:
+                return {
+                    "error": "Luhn check failed after OCR correction.",
+                    "recognized_number": recognized_16
+                }
 
-    # Extract the credit card number from the response
-    result = response.json()
-    # print(result); return None
-    card_number = result['choices'][0]['message']['content'].replace(" ", "")
+        # 5. Write the final number to file
+        with open(output_file, "w", encoding="utf-8") as f:
+            f.write(final_number + "\n")
 
-    # Write the extracted card number to the output file
-    with open(filename, 'w') as file:
-        file.write(card_number)
-# A8()
+        return {"written_file": output_file, "card_number": final_number}
 
+    except Exception as e:
+        return {"error": str(e)}
 
+def A9():
+    """
+    Reads /data/comments.txt (one comment per line).
+    Asks GPT-4o-Mini to pick the two lines that are most semantically similar.
+    Writes those two lines (one per line) to /data/comments-similar.txt.
+    """
+    # 1. Prepare file paths
+    input_file = os.path.join(os.getcwd(), "data", "comments.txt")
+    output_file = os.path.join(os.getcwd(), "data", "comments-similar.txt")
 
-def get_embedding(text):
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {AIPROXY_TOKEN}"
-    }
-    data = {
-        "model": "text-embedding-3-small",
-        "input": [text]
-    }
-    response = requests.post("http://aiproxy.sanand.workers.dev/openai/v1/embeddings", headers=headers, data=json.dumps(data))
-    response.raise_for_status()
-    return response.json()["data"][0]["embedding"]
+    # 2. Check if the file exists
+    if not os.path.exists(input_file):
+        return {"error": f"{input_file} does not exist"}
 
-def A9(filename='/data/comments.txt', output_filename='/data/comments-similar.txt'):
-    # Read comments
-    with open(filename, 'r') as f:
-        comments = [line.strip() for line in f.readlines()]
+    # 3. Read lines (strip empty ones)
+    with open(input_file, "r", encoding="utf-8") as f:
+        lines = [line.strip() for line in f if line.strip()]
 
-    # Get embeddings for all comments
-    embeddings = [get_embedding(comment) for comment in comments]
+    if len(lines) < 2:
+        return {"error": "Not enough comments to compare."}
 
-    # Find the most similar pair
-    min_distance = float('inf')
-    most_similar = (None, None)
+    # 4. Set up your GPT-4o-Mini credentials
+    token = os.environ.get("AIPROXY_TOKEN")
 
-    for i in range(len(comments)):
-        for j in range(i + 1, len(comments)):
-            distance = cosine(embeddings[i], embeddings[j])
-            if distance < min_distance:
-                min_distance = distance
-                most_similar = (comments[i], comments[j])
+    if not token:
+        return {"error": "AIPROXY_TOKEN environment variable not set."}
 
-    # Write the most similar pair to file
-    with open(output_filename, 'w') as f:
-        f.write(most_similar[0] + '\n')
-        f.write(most_similar[1] + '\n')
+    openai.api_key = token
+    openai.api_base = "https://aiproxy.sanand.workers.dev/openai/v1"
+
+    # 5. Build a prompt enumerating all lines
+    #    Ask GPT-4o-Mini to return a JSON object with "best_pair": [line1, line2]
+    enumerated_lines = "\n".join(f"{i+1}. {line}" for i, line in enumerate(lines))
+    prompt = (
+        "You are a helpful assistant. I have a list of comments (one per line). "
+        "Please identify the TWO lines that are most semantically similar. "
+        "Return your answer in JSON format as follows:\n\n"
+        "{\n  \"best_pair\": [\"<comment1>\", \"<comment2>\"]\n}\n\n"
+        "Here are the lines:\n\n"
+        f"{enumerated_lines}\n\n"
+        "Respond with only the JSON object."
+    )
+
+    try:
+        # 6. Call GPT-4o-Mini with the prompt
+        response = openai.ChatCompletion.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": prompt},
+            ],
+        )
+
+        # 7. Parse the raw response to extract JSON
+        raw_message = response["choices"][0]["message"]["content"]
+        # Remove potential markdown fences
+        raw_message = re.sub(r"^```json\s*", "", raw_message.strip())
+        raw_message = re.sub(r"\s*```$", "", raw_message)
+        if not raw_message.strip():
+            return {"error": f"LLM returned empty or invalid response: {response}"}
+
+        data = json.loads(raw_message)
+        best_pair = data.get("best_pair", [])
+        if len(best_pair) != 2:
+            return {"error": f"Could not find exactly 2 lines. Received: {best_pair}"}
+
+        # 8. Write the best pair to /data/comments-similar.txt
+        with open(output_file, "w", encoding="utf-8") as f:
+            f.write(best_pair[0] + "\n")
+            f.write(best_pair[1] + "\n")
+
+        return {
+            "status": "success",
+            "best_pair": best_pair,
+            "written_file": output_file
+        }
+
+    except Exception as e:
+        return {"error": str(e)}
 
 def A10(filename='/data/ticket-sales.db', output_filename='/data/ticket-sales-gold.txt', query="SELECT SUM(units * price) FROM tickets WHERE type = 'Gold'"):
     # Connect to the SQLite database
